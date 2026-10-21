@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using MSFC.Models;
 using Microsoft.EntityFrameworkCore;
@@ -37,6 +37,8 @@ public partial class MMesDbContext : DbContext
 
     public virtual DbSet<TbProductionPlan> TbProductionPlans { get; set; }
 
+    public virtual DbSet<TbProductionBlock> TbProductionBlocks { get; set; }
+
     public virtual DbSet<TbRomColor> TbRomColors { get; set; }
 
     public virtual DbSet<TbRomDatum> TbRomData { get; set; }
@@ -48,6 +50,8 @@ public partial class MMesDbContext : DbContext
     public virtual DbSet<TbStationMonitoring> TbStationMonitorings { get; set; }
 
     public virtual DbSet<TbUser> TbUsers { get; set; }
+
+    public virtual DbSet<TbXrayScanLog> TbXrayScanLogs { get; set; }
 
     //protected override void OnConfiguring(DbContextOptionsBuilder optionsBuilder)
     //    //=> optionsBuilder.UseMySql("server=192.168.0.4;user=scott;password=ivihaengsung@1;database=mex_mes", Microsoft.EntityFrameworkCore.ServerVersion.Parse("9.1.0-mysql"));
@@ -150,6 +154,46 @@ public partial class MMesDbContext : DbContext
                 .HasMaxLength(1)
                 .HasComment("B: Block - R: Release")
                 .HasColumnName("STATUS");
+        });
+
+        modelBuilder.Entity<TbProductionBlock>(entity =>
+        {
+            entity.HasKey(e => e.Pid).HasName("PRIMARY");
+
+            entity.ToTable("tb_production_block");
+
+            entity.HasIndex(e => new { e.Pid, e.Status }, "idx_pid_status");
+
+            entity.Property(e => e.Pid)
+                .HasMaxLength(30)
+                .HasColumnName("pid");
+            entity.Property(e => e.WoName)
+                .HasMaxLength(50)
+                .HasColumnName("wo_name");
+            entity.Property(e => e.McId)
+                .HasMaxLength(50)
+                .HasColumnName("mc_id");
+            entity.Property(e => e.McType)
+                .HasMaxLength(30)
+                .HasColumnName("mc_type");
+            entity.Property(e => e.Reason)
+                .HasMaxLength(100)
+                .HasColumnName("reason");
+            entity.Property(e => e.UserId)
+                .HasMaxLength(30)
+                .HasColumnName("user_id");
+            entity.Property(e => e.Status)
+                .HasDefaultValueSql("'1'")
+                .HasColumnName("status");
+            entity.Property(e => e.CreatedAt)
+                .HasDefaultValueSql("CURRENT_TIMESTAMP")
+                .HasColumnType("datetime")
+                .HasColumnName("created_at");
+            entity.Property(e => e.UpdatedAt)
+                .ValueGeneratedOnAddOrUpdate()
+                .HasDefaultValueSql("CURRENT_TIMESTAMP")
+                .HasColumnType("datetime")
+                .HasColumnName("updated_at");
         });
 
         modelBuilder.Entity<TbDefectImage>(entity =>
@@ -619,6 +663,25 @@ public partial class MMesDbContext : DbContext
             entity.HasOne(d => d.Role).WithMany(p => p.TbUsers)
                 .HasForeignKey(d => d.RoleId)
                 .HasConstraintName("fk_user_role");
+        });
+
+        modelBuilder.Entity<TbXrayScanLog>(entity =>
+        {
+            entity.HasKey(e => e.Id).HasName("PRIMARY");
+
+            entity.ToTable("tb_xray_scan_log");
+
+            entity.Property(e => e.Id).HasColumnName("id");
+            entity.Property(e => e.BatchCode).HasMaxLength(100).HasColumnName("batch_code");
+            entity.Property(e => e.Pid1).HasMaxLength(100).HasColumnName("pid1");
+            entity.Property(e => e.Pid2).HasMaxLength(100).HasColumnName("pid2");
+            entity.Property(e => e.Pid3).HasMaxLength(100).HasColumnName("pid3");
+            entity.Property(e => e.Pid4).HasMaxLength(100).HasColumnName("pid4");
+            entity.Property(e => e.Pid5).HasMaxLength(100).HasColumnName("pid5");
+            entity.Property(e => e.Pid6).HasMaxLength(100).HasColumnName("pid6");
+            entity.Property(e => e.ScanAt).HasColumnType("datetime").HasColumnName("scan_at");
+            entity.Property(e => e.ClientIp).HasMaxLength(45).HasColumnName("client_ip");
+            entity.Property(e => e.PrintedAt).HasColumnType("datetime").HasColumnName("printed_at");
         });
 
         OnModelCreatingPartial(modelBuilder);

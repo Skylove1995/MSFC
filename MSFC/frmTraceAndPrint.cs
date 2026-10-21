@@ -1,4 +1,4 @@
-﻿using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore;
 using MSFC.Data;
 using MSFC.Dto;
 using QRCoder;
@@ -30,12 +30,52 @@ namespace MSFC
         {
             _dbFactory = dbFactory;
             InitializeComponent();
+            try { this.Icon = Form1.GetAppIcon(); } catch { }
             string hostName = Dns.GetHostName();
             // Get IP of client
             _ClientIp = Dns.GetHostAddresses(hostName)
                            .FirstOrDefault(a => a.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
                            ?.ToString() ?? DateTime.Now.ToString("ffff");
             setPlaceHlderText();
+            SetupSettingButton();
+        }
+
+        private void SetupSettingButton()
+        {
+            try
+            {
+                Button btnSetting = new Button
+                {
+                    Text = "⚙️ Settings",
+                    Size = new Size(110, 34),
+                    BackColor = Color.White,
+                    ForeColor = Color.Black,
+                    FlatStyle = FlatStyle.Flat,
+                    Font = new Font("Segoe UI", 9.5F, FontStyle.Bold),
+                    Cursor = Cursors.Hand
+                };
+                btnSetting.FlatAppearance.BorderSize = 1;
+                btnSetting.FlatAppearance.BorderColor = Color.DarkGray;
+
+                btnSetting.Click += (s, e) =>
+                {
+                    using var pwdDlg = new frmAdminPassword();
+                    if (pwdDlg.ShowDialog(this) == DialogResult.OK && pwdDlg.IsAuthenticated)
+                    {
+                        using var settingsDlg = new frmSettings();
+                        settingsDlg.ShowDialog(this);
+                    }
+                };
+
+                btnSetting.Anchor = AnchorStyles.Bottom | AnchorStyles.Left;
+                btnSetting.Location = new Point(10, this.ClientSize.Height - 42);
+                this.Controls.Add(btnSetting);
+                btnSetting.BringToFront();
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"[SetupSettingButton Error] {ex.Message}");
+            }
         }
 
         private void frmTraceAndPrint_Load(object sender, EventArgs e)
@@ -192,8 +232,11 @@ namespace MSFC
         }
         #region Print Setting & Generate label tag
         // offset cấu hình (mm). dương = dịch xuống / dịch sang phải
-        float _offsetXmm = 0.0f;   // ví dụ 1.5f để dịch phải 1.5mm
-        float _offsetYmm = 1.5f;   // ví dụ 1.5f để dịch xuống 1.5mm
+        float _offsetXmm = 0.0f;
+        float _offsetYmm = -2.0f;
+        float _labelWidthMm = 55.0f;
+        float _labelHeightMm = 45.0f;
+        float _topMarginMm = 2.0f;
 
         // đổi mm -> hundredths of an inch (đơn vị của MarginBounds)
         static int MmToHundredths(float mm) => (int)Math.Round(mm / 25.4f * 100f);
@@ -206,12 +249,22 @@ namespace MSFC
                 var doc = new PrintDocument();
                 doc.PrinterSettings = new PrinterSettings();
 
-                // lấy đúng size ~55x38mm từ driver (217x150 hundredths-inch)
+                // Chuyển đổi mm sang đơn vị máy in
+                int w = MmToHundredths(_labelWidthMm);
+                int h = MmToHundredths(_labelHeightMm);
+
+                // Tìm khổ giấy khớp
                 var ps = doc.PrinterSettings.PaperSizes
                     .Cast<PaperSize>()
-                    .FirstOrDefault(p => (Math.Abs(p.Width - 217) < 5 && Math.Abs(p.Height - 150) < 5)
-                                      || (Math.Abs(p.Width - 150) < 5 && Math.Abs(p.Height - 217) < 5));
-                if (ps != null) doc.DefaultPageSettings.PaperSize = ps;
+                    .FirstOrDefault(p =>
+                        (Math.Abs(p.Width - w) < 15 && Math.Abs(p.Height - h) < 15) ||
+                        (Math.Abs(p.Width - h) < 15 && Math.Abs(p.Height - w) < 15)
+                    );
+
+                if (ps != null)
+                    doc.DefaultPageSettings.PaperSize = ps;
+                else
+                    doc.DefaultPageSettings.PaperSize = new PaperSize($"Custom {_labelWidthMm}x{_labelHeightMm}", w, h);
 
                 doc.DefaultPageSettings.Margins = new System.Drawing.Printing.Margins(0, 0, 0, 0);
                 doc.OriginAtMargins = true;              // (0,0) = MarginBounds.TopLeft
@@ -236,17 +289,11 @@ namespace MSFC
         }
         void GenerateLabel_FitMarginBounds(object sender, PrintPageEventArgs e)
         {
+            if (_tagLabel == null) { e.Cancel = true; return; }
             var g = e.Graphics;
+
             try
             {
-                // safety
-                if (_tagLabel == null)
-                {
-                    e.HasMorePages = false;
-                    return;
-                }
-
-                // device bounds prefer MarginBounds
                 Rectangle deviceBounds = e.MarginBounds;
                 if (deviceBounds.Width <= 0 || deviceBounds.Height <= 0)
                 {
@@ -266,64 +313,48 @@ namespace MSFC
                     return;
                 }
 
-                // DESIGN: 55mm x 38mm => design units in hundredths of inch
-                float designW = 217f; // ~55mm
-                float designH = 150f; // ~38mm
+                // Thiết lập kích thước thiết kế theo biến cấu hình
+                float designW = MmToHundredths(_labelWidthMm);
+                float designH = MmToHundredths(_labelHeightMm);
 
                 // Compute key layout values in design units (same logic as DrawTag_DesignUnits)
-                float padY = designH * 0.05f;            // top/bottom pad used in DrawTag_DesignUnits
-                float titleHeight = designH * 0.18f;     // title area height
-                                                         // yStart = padY + titleHeight + small gap (0.02*H)
-                float yStart = padY + titleHeight + designH * 0.02f;
-                // textH = (H - padY) - yStart
-                float textH = (designH - padY) - yStart;
-                float lineH = textH / 4f;                // 4 lines, last one is Q'TY
-                                                         // bottom of Q'TY line sits at: yStart + 3*lineH + lineH = yStart + textH = designH - padY
+                float padY = designH * 0.015f;            // top/bottom pad
                 float bottomOfQty = designH - padY;
 
-                // small extra gap after Q'TY in mm (how much paper you want after the line)
-                float extraGapMm = 0.1f; // tweak this (0.1 mm recommended)
-                int extraGapDeviceUnits = MmToHundredths(extraGapMm); // in hundredths of inch (device units)
+                // small extra gap after content in mm
+                float extraGapMm = 0.1f;
+                int extraGapDeviceUnits = MmToHundredths(extraGapMm);
 
-                // We want to compute required device height to include content up to bottomOfQty + extraGap
-                // Choose scale based on width (so width fits design exactly) — avoids unexpected shrink/stretch
+                // Tính scale dựa trên chiều rộng
                 float scaleBasedOnWidth = dest.Width / designW;
 
-                // Required device height to include bottomOfQty:
+                // Chiều cao thiết bị yêu cầu để vẽ hết nội dung:
                 float requiredDeviceHeight = bottomOfQty * scaleBasedOnWidth + extraGapDeviceUnits;
 
-                // If device is continuous (dest.Height very large), clamp to requiredDeviceHeight to avoid long feed
-                // We'll consider "continuous" when dest.Height >> designH
+                // Nếu thiết bị in là giấy liên tục (continuous paper - dest.Height rất lớn)
                 float continuousThresholdMultiplier = 3.0f;
                 if (dest.Height > designH * continuousThresholdMultiplier)
                 {
-                    // clamp but ensure at least some minimal height
-                    int minAllowed = MmToHundredths(10); // at least 10mm tall as safety floor
+                    int minAllowed = MmToHundredths(10); // Tối thiểu 10mm
                     int clampH = Math.Max(minAllowed, (int)Math.Ceiling(requiredDeviceHeight));
-                    // limit clamp to dest.Height if smaller
                     dest = new Rectangle(dest.Left, dest.Top, dest.Width, Math.Min(dest.Height, clampH));
-                    // Recompute scale: prefer width-based scale but ensure not to exceed vertical space
+
                     float scaleYIfNeeded = (float)dest.Height / designH;
-                    // final scale chosen should not make content exceed dest: so take min(scaleBasedOnWidth, scaleYIfNeeded)
                     float scale = Math.Min(scaleBasedOnWidth, scaleYIfNeeded);
 
-                    // final drawn sizes
                     float drawnW = designW * scale;
-                    float drawnH = bottomOfQty * scale + extraGapDeviceUnits; // we only need height to bottom QTY + gap in device units
 
-                    // compute translate: center horizontally, top align vertically with a small top padding (use offsetYmm)
                     float translateX = dest.Left + (dest.Width - drawnW) / 2f;
-                    float topPadding = MmToHundredths(1.0f); // 1mm top padding device units
-                    float translateY = dest.Top + topPadding;
+                    float topMarginUnit = MmToHundredths(_topMarginMm);
+                    float offsetUnit    = MmToHundredths(_offsetYmm);
+                    float translateY = dest.Top + topMarginUnit + offsetUnit;
 
-                    // Apply transform: note ScaleTransform expects scale relative to design units -> we use 'scale'
                     var state = g.Save();
                     try
                     {
                         g.TranslateTransform(translateX, translateY);
                         g.ScaleTransform(scale, scale);
 
-                        // Draw full design in design coordinates; drawing area will be clipped by dest/driver
                         DrawTag_DesignUnits(g, designW, designH, _tagLabel);
                     }
                     finally
@@ -335,17 +366,18 @@ namespace MSFC
                     return;
                 }
 
-                // Non-continuous case (normal page): compute scale uniformly based on min(scaleX, scaleY)
+                // Khổ giấy thông thường
                 float scaleX = dest.Width / designW;
                 float scaleY = dest.Height / designH;
                 float finalScale = Math.Min(scaleX, scaleY);
+                if (finalScale > 1.0f) finalScale = 1.0f;
 
                 float finalDrawnW = designW * finalScale;
-                float finalDrawnH = designH * finalScale;
 
                 float translateXNormal = dest.Left + (dest.Width - finalDrawnW) / 2f;
-                float topPaddingNormal = MmToHundredths(1.5f);
-                float translateYNormal = dest.Top + topPaddingNormal;
+                float topMarginUnitNormal = MmToHundredths(_topMarginMm);
+                float offsetUnitNormal    = MmToHundredths(_offsetYmm);
+                float translateYNormal = dest.Top + topMarginUnitNormal + offsetUnitNormal;
 
                 var stateNormal = g.Save();
                 try
@@ -368,66 +400,97 @@ namespace MSFC
                 e.HasMorePages = false;
             }
         }
-        /// <summary>
-        /// Vẽ nội dung tem theo "design units" (1/100 inch), ví dụ W≈197, H≈98 cho tem 50x25mm.
-        /// Không phụ thuộc DPI vì phần gọi đã scale-fit vào e.MarginBounds.
-        /// </summary>
+
         void DrawTag_DesignUnits(Graphics g, float W, float H, ManufacturingTagDto tag)
         {
-            // ———————————————————————————————————————————————————————————
-            // 1) SETUP & LAYOUT PARAMETERS
-            // ———————————————————————————————————————————————————————————
             using var pen = new Pen(Color.Black, 1);
 
-            // Draw Border (Vẽ viền cho Label)
+            // 1. VẼ VIỀN
             g.DrawRectangle(pen, 0, 0, W - 1, H - 1);
 
-            float padX = W * 0.02f;
-            float padY = H * 0.05f;
+            // 2. Padding nhỏ (1.5%)
+            float padX = W * 0.015f;
+            float padY = H * 0.015f;
 
-            // Fonts
-            using var fTitle = new Font("Segoe UI", 14, FontStyle.Bold, GraphicsUnit.Point);
-            using var fBody = new Font("Arial Narrow", 11, FontStyle.Bold, GraphicsUnit.Point);
+            using var fTitle = new Font("Segoe UI", 11, FontStyle.Bold, GraphicsUnit.Point);
+            using var fBody  = new Font("Arial Narrow", 9, FontStyle.Bold, GraphicsUnit.Point);
 
-            // ———————————————————————————————————————————————————————————
-            // 2) TITLE: "Manufacture Tag"
-            // ———————————————————————————————————————————————————————————
-            // Title takes top 15-20%
-            var titleRect = new RectangleF(padX, padY, W - padX * 2, H * 0.18f);
-            var sfn = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
+            // 3. TITLE AREA (~16% chiều cao)
+            float titleH    = H * 0.16f;
+            var   titleRect = new RectangleF(padX, padY, W - padX * 2, titleH);
+            var   sfn       = new StringFormat { Alignment = StringAlignment.Near, LineAlignment = StringAlignment.Center };
 
             g.DrawString("Manufacture Tag", fTitle, Brushes.Black, titleRect, sfn);
 
-            // ———————————————————————————————————————————————————————————
-            // 3) TEXT BLOCK (4 Lines: Model Name, Date, Part No, Q'TY)
-            // ———————————————————————————————————————————————————————————
-            float yStart = titleRect.Bottom + H * 0.02f;
-            float textH = (H - padY) - yStart;
-            float lineH = textH / 4.0f; // 4 equal lines
-            float textW = W - padX * 2; // Full width since no QR
+            float separatorY = titleRect.Bottom;
+            g.DrawLine(pen, 0, separatorY, W, separatorY);
 
-            // Helper to draw fit text
+            // 4. BODY CONTENT
+            float bodyY = separatorY + 1.0f;
+            float bodyH = (H - padY) - bodyY;
+            float lineH = bodyH / 6.0f; // 6 dòng
+
+            // QR zone: bên phải label, góc dưới cùng
+            float qrSize = bodyH * 0.45f;                       // Giảm QR xuống 45% chiều cao body
+            float qrGap  = W * 0.015f;                          // khoảng cách giữa text và QR
+            float qrX    = W - padX - qrSize - (W * 0.30f);     // dịch trái 30% chiều rộng nhãn để sát gần Ins1, Ins2
+            float qrY    = bodyY + bodyH - qrSize;              // đẩy QR xuống đáy của body (căn dưới)
+            float textW_narrow  = qrX - qrGap - padX;           // text thu hẹp, không chồng QR
+            float textW_full    = W - padX * 2;                 // text full chiều ngang
+
             void DrawLine(string text, Font font, int index)
             {
-                float y = yStart + index * lineH;
-                var rect = new RectangleF(padX, y, textW, lineH);
-                // Left align for body text
-                var sfnBody = new StringFormat { Alignment = StringAlignment.Near, LineAlignment = StringAlignment.Center };
-                // Using DrawFitText if available, or standard DrawString
-                DrawFitText(g, text, font, Brushes.Black, rect, 6.0f);
+                float y    = bodyY + (index * lineH);
+                float currentTextW = (y + lineH * 0.8f > qrY) ? textW_narrow : textW_full;
+                var   rect = new RectangleF(padX, y, currentTextW, lineH);
+                DrawFitText(g, text, font, Brushes.Black, rect, 4.5f);
             }
 
-            // Line 1: Model Name
-            DrawLine($"Model Name {tag?.ModelName ?? ""}", fBody, 0);
+            DrawLine($"{tag?.ModelName ?? ""}",                 fBody, 0);
+            DrawLine($"Date: {tag?.Date ?? ""}",                fBody, 1);
+            DrawLine($"Part No: {FormatPartNo(tag?.PartNo)}",   fBody, 2);
+            DrawLine($"Q'ty: {tag?.Quantity}",                  fBody, 3);
+            DrawLine($"Ins 1: {tag?.Inspector1 ?? ""}",   fBody, 4);
+            DrawLine($"Ins 2: {tag?.Inspector2 ?? ""}",   fBody, 5);
 
-            // Line 2: Date
-            DrawLine($"Date {tag?.Date ?? ""}", fBody, 1);
+            // 5. QR CODE — nội dung = Part No (EBR)
+            string qrContent = tag?.PartNo ?? "";
+            if (!string.IsNullOrEmpty(qrContent))
+            {
+                try
+                {
+                    using var qrGenerator = new QRCodeGenerator();
+                    using var qrData      = qrGenerator.CreateQrCode(qrContent, QRCodeGenerator.ECCLevel.M);
+                    using var qrCode      = new QRCode(qrData);
 
-            // Line 3: Part No
-            DrawLine($"Part No {tag?.PartNo ?? ""}", fBody, 2);
+                    // FIX: dùng pixel thực (10px/module) thay vì design units
+                    // → đảm bảo bitmap đủ độ phân giải trước khi scale vào qrRect
+                    int pixelPerModule = 10;
+                    using Bitmap qrBitmap = qrCode.GetGraphic(pixelPerModule, Color.Black, Color.White, drawQuietZones: true);
 
-            // Line 4: Q'TY
-            DrawLine($"Q'TY {tag?.Quantity.ToString() ?? ""}", fBody, 3);
+                    var qrRect = new RectangleF(qrX, qrY, qrSize, qrSize);
+                    g.DrawImage(qrBitmap, qrRect);
+                }
+                catch (Exception ex)
+                {
+                    // Log lỗi QR để debug — label vẫn in bình thường
+                    System.Diagnostics.Debug.WriteLine($"[QR ERROR] {ex.GetType().Name}: {ex.Message}");
+                    AddLog($"[QR ERROR] {ex.GetType().Name}: {ex.Message}");
+                }
+            }
+        }
+
+        string FormatPartNo(string? partNo)
+        {
+            if (string.IsNullOrWhiteSpace(partNo) || partNo.Length < 11)
+                return partNo ?? "";
+
+            // Ví dụ: EBR12345678 → EBR 1234 5678
+            string prefix = partNo.Substring(0, 3);
+            string mid    = partNo.Substring(3, 4);
+            string end    = partNo.Substring(7, 4);
+
+            return $"{prefix} {mid} {end}";
         }
 
         /// <summary>
@@ -469,55 +532,6 @@ namespace MSFC
             using var fMin = new Font(baseFont.FontFamily, minPointSize, baseFont.Style, GraphicsUnit.Point);
             g.DrawString(text, fMin, brush, rect, fmt);
         }
-
-        /// <summary>
-        /// Định dạng EBR để hiển thị: 
-        /// "EBR12345678" → "EBR 1234 5678"
-        /// Nếu không đúng pattern thì giữ nguyên.
-        /// </summary>
-        static string FormatEbr(string input)
-        {
-            if (string.IsNullOrWhiteSpace(input)) return string.Empty;
-
-            input = input.Trim().ToUpperInvariant();
-
-            // Nếu bắt đầu bằng EBR và có ít nhất 9 ký tự
-            if (input.StartsWith("EBR") && input.Length > 7)
-            {
-                string prefix = input.Substring(0, 3); // "EBR"
-                string rest = input.Substring(3);
-
-                // Cắt thành block 4-4
-                if (rest.Length >= 8)
-                {
-                    string part1 = rest.Substring(0, 4);
-                    string part2 = rest.Substring(4, Math.Min(4, rest.Length - 4));
-                    return $"{prefix} {part1} {part2}";
-                }
-                else if (rest.Length >= 4)
-                {
-                    string part1 = rest.Substring(0, 4);
-                    string part2 = rest.Substring(4);
-                    return $"{prefix} {part1} {part2}";
-                }
-            }
-
-            return input;
-        }
-
-
-        private Bitmap GenerateQRCode(string value, int preferDpi = 300) //Qrcode
-        {
-            var gen = new QRCodeGenerator();
-            var data = gen.CreateQrCode(string.IsNullOrEmpty(value) ? "-" : value,
-                                        QRCodeGenerator.ECCLevel.M);
-
-            var qrCode = new QRCode(data);
-            var bmp = qrCode.GetGraphic(8, Color.Black, Color.White, true);
-            bmp.SetResolution(preferDpi, preferDpi);
-            return bmp;
-        }
-        #endregion
         string IpToNumericString(string ip)
         {
             return string.Join("", ip.Split('.').Select(b => int.Parse(b).ToString("D3")));
@@ -609,7 +623,7 @@ namespace MSFC
                 _tagLabel = new ManufacturingTagDto
                 {
                     ModelName = $"{tagDatas[0].ModelName}-{tagDatas[0].Board}",
-                    Date = now.ToString("dd/MM/yyyy"),
+                    Date = now.ToString("dd/MM/yyyy HH:mm:ss"),
                     PartNo = tagDatas[0].PartNo,
                     Quantity = tagDatas.Count,                // ✅ chỉ đếm batch hiện tại
                     Process = "",
@@ -674,3 +688,5 @@ namespace MSFC
         }
     }
 }
+
+#endregion

@@ -1,4 +1,4 @@
-﻿using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore;
 using MSFC.Data;
 using System;
 using System.Collections.Generic;
@@ -6,6 +6,7 @@ using System.ComponentModel;
 using System.Data;
 using System.Drawing;
 using System.Linq;
+using System.Reflection;
 using System.Text;
 using System.Threading.Tasks;
 using System.Windows.Forms;
@@ -16,15 +17,30 @@ namespace MSFC.UC
     {
         private readonly IDbContextFactory<MMesDbContext> _dbFactory;
         private readonly string _clientIp;
+
         public Summary(IDbContextFactory<MMesDbContext> dbFactory, string clientIp)
         {
             _dbFactory = dbFactory;
             _clientIp = clientIp;
 
             InitializeComponent();
+            try { this.Icon = Form1.GetAppIcon(); } catch { }
 
+            EnableDoubleBuffering(dvSummary);
+
+            lblSubTitle.Text = $"🖥️ Client IP / IP Cliente: {_clientIp}";
             dtFromTime.Value = DateTime.Today;
-            dtToTime.Value = DateTime.Today.AddDays(1).AddSeconds(-1);
+            dtToTime.Value = DateTime.Today;
+
+            // Đăng ký sự kiện định dạng Cell cho DataGridView
+            dvSummary.CellFormatting += DvSummary_CellFormatting;
+        }
+
+        private static void EnableDoubleBuffering(Control control)
+        {
+            typeof(Control).InvokeMember("DoubleBuffered",
+                BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.SetProperty,
+                null, control, new object[] { true });
         }
 
         private void Summary_Load(object sender, EventArgs e)
@@ -39,19 +55,20 @@ namespace MSFC.UC
 
         private void LoadSummary()
         {
-            // Kiểm tra hợp lệ (chỉ so sánh ngày để tránh lỗi do giờ)
             if (dtFromTime.Value.Date > dtToTime.Value.Date)
             {
-                MessageBox.Show("Khoảng thời gian không hợp lệ", "Thông báo", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                MessageBox.Show(
+                    "Invalid date range: 'From Date' cannot be greater than 'To Date'.\n" +
+                    "Rango de fechas inválido: 'Desde' no puede ser mayor que 'Hasta'.",
+                    "Warning / Advertencia", 
+                    MessageBoxButtons.OK, 
+                    MessageBoxIcon.Warning);
                 return;
             }
 
             using var dbContext = _dbFactory.CreateDbContext();
 
-            // --- CHỈNH SỬA NGÀY GIỜ ---
-            // Lấy từ đầu ngày (00:00:00) của dtFromTime
             var from = dtFromTime.Value.Date;
-            // Lấy đến cuối ngày (23:59:59) của dtToTime
             var to = dtToTime.Value.Date.AddDays(1).AddSeconds(-1);
 
             var records = dbContext.TbScanOuts
@@ -62,43 +79,108 @@ namespace MSFC.UC
                 {
                     ScanAt = s.ScanAt!.Value,
                     Qty = s.Qty ?? 1,
-                    PartNo = s.PartNo // --- LẤY THÊM PART_NO ---
+                    PartNo = s.PartNo
                 })
                 .AsEnumerable()
-                .Select(s => new ScanRecord(s.ScanAt, s.Qty, s.PartNo)) // Truyền PartNo vào record
+                .Select(s => new ScanRecord(s.ScanAt, s.Qty, s.PartNo))
                 .ToList();
 
             var summaries = BuildSummary(records);
             dvSummary.DataSource = summaries;
 
-            // --- CẤU HÌNH HEADER CỘT ---
-            dvSummary.Columns["Date"].HeaderText = "Date";
-            dvSummary.Columns["PartNo"].HeaderText = "Part No"; // Header cho cột mới
-            dvSummary.Columns["Slot0730To1000"].HeaderText = "07:30 - 10:00";
-            dvSummary.Columns["Slot1000To1230"].HeaderText = "10:00 - 12:30";
-            dvSummary.Columns["Slot1230To1515"].HeaderText = "12:30 - 15:15";
-            dvSummary.Columns["Slot1515To1730"].HeaderText = "15:15 - 17:30";
-            dvSummary.Columns["Slot1730To2000"].HeaderText = "17:30 - 20:00";
-            dvSummary.Columns["Slot2000To0730"].HeaderText = "20:00 - 07:30";
-            dvSummary.Columns["Total"].HeaderText = "Total";
+            // --- CẬP NHẬT KPI SUMMARY ---
+            int totalScans = records.Count;
+            int totalQty = records.Sum(r => r.Qty);
+            int partCount = summaries.Select(s => s.PartNo).Where(p => !string.IsNullOrEmpty(p)).Distinct().Count();
 
-            // Đảm bảo cột PartNo hiển thị ở vị trí mong muốn (ví dụ sau cột Date)
+            lblKpiTotalScanVal.Text = totalScans.ToString("N0");
+            lblKpiTotalQtyVal.Text = totalQty.ToString("N0");
+            lblKpiPartCountVal.Text = partCount.ToString("N0");
+
+            // --- CẤU HÌNH HEADER CỘT (SONG NGỮ ANH - TÂY BAN NHA/MEXICO) ---
+            if (dvSummary.Columns["Date"] != null)
+            {
+                dvSummary.Columns["Date"].HeaderText = "Date / Fecha";
+                dvSummary.Columns["Date"].DefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleCenter;
+                dvSummary.Columns["Date"].FillWeight = 90;
+            }
             if (dvSummary.Columns["PartNo"] != null)
+            {
+                dvSummary.Columns["PartNo"].HeaderText = "Part No / Núm. Parte";
                 dvSummary.Columns["PartNo"].DisplayIndex = 1;
+                dvSummary.Columns["PartNo"].DefaultCellStyle.Font = new Font("Segoe UI", 9.5F, FontStyle.Bold);
+                dvSummary.Columns["PartNo"].FillWeight = 140;
+            }
+            if (dvSummary.Columns["Slot0730To1000"] != null)
+            {
+                dvSummary.Columns["Slot0730To1000"].HeaderText = "07:30 - 10:00";
+                dvSummary.Columns["Slot0730To1000"].DefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleCenter;
+            }
+            if (dvSummary.Columns["Slot1000To1230"] != null)
+            {
+                dvSummary.Columns["Slot1000To1230"].HeaderText = "10:00 - 12:30";
+                dvSummary.Columns["Slot1000To1230"].DefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleCenter;
+            }
+            if (dvSummary.Columns["Slot1230To1515"] != null)
+            {
+                dvSummary.Columns["Slot1230To1515"].HeaderText = "12:30 - 15:15";
+                dvSummary.Columns["Slot1230To1515"].DefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleCenter;
+            }
+            if (dvSummary.Columns["Slot1515To1730"] != null)
+            {
+                dvSummary.Columns["Slot1515To1730"].HeaderText = "15:15 - 17:30";
+                dvSummary.Columns["Slot1515To1730"].DefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleCenter;
+            }
+            if (dvSummary.Columns["Slot1730To2000"] != null)
+            {
+                dvSummary.Columns["Slot1730To2000"].HeaderText = "17:30 - 20:00";
+                dvSummary.Columns["Slot1730To2000"].DefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleCenter;
+            }
+            if (dvSummary.Columns["Slot2000To0730"] != null)
+            {
+                dvSummary.Columns["Slot2000To0730"].HeaderText = "20:00 - 07:30";
+                dvSummary.Columns["Slot2000To0730"].DefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleCenter;
+            }
+            if (dvSummary.Columns["Total"] != null)
+            {
+                dvSummary.Columns["Total"].HeaderText = "TOTAL / TOTAL";
+                dvSummary.Columns["Total"].DefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleCenter;
+                dvSummary.Columns["Total"].FillWeight = 110;
+            }
+
+            // Dòng xen kẽ màu sáng dễ nhìn
+            dvSummary.AlternatingRowsDefaultCellStyle.BackColor = Color.FromArgb(248, 250, 252);
+        }
+
+        private void DvSummary_CellFormatting(object sender, DataGridViewCellFormattingEventArgs e)
+        {
+            if (e.RowIndex < 0 || e.ColumnIndex < 0) return;
+
+            string columnName = dvSummary.Columns[e.ColumnIndex].Name;
+
+            // Highlight cột TOTAL bằng màu xanh bạc hà dịu nhẹ và chữ in đậm
+            if (columnName == "Total")
+            {
+                e.CellStyle.BackColor = Color.FromArgb(236, 253, 245); // Light Emerald Mint
+                e.CellStyle.ForeColor = Color.FromArgb(4, 120, 87);    // Deep Green
+                e.CellStyle.Font = new Font("Segoe UI", 10F, FontStyle.Bold);
+            }
+            // Làm mờ các số 0 để các con số sản lượng nổi bật hơn
+            else if (e.Value is int intVal && intVal == 0 && columnName != "PartNo" && columnName != "Date")
+            {
+                e.CellStyle.ForeColor = Color.FromArgb(203, 213, 225); // Muted Silver
+            }
         }
 
         private List<SummaryRow> BuildSummary(IEnumerable<ScanRecord> records)
         {
-            // Key của Dictionary bây giờ là cặp (DateOnly, PartNo)
             var result = new Dictionary<(DateOnly, string), SummaryRow>();
 
             foreach (var record in records)
             {
                 var slotInfo = GetSlotInfo(record.ScanAt);
-                // Xử lý null cho PartNo nếu cần
                 string pNo = record.PartNo ?? "";
 
-                // Tạo key tổng hợp
                 var key = (slotInfo.Day, pNo);
 
                 if (!result.TryGetValue(key, out var row))
@@ -133,7 +215,7 @@ namespace MSFC.UC
 
             return result.Values
                 .OrderBy(r => r.Date)
-                .ThenBy(r => r.PartNo) // Sắp xếp thêm theo PartNo
+                .ThenBy(r => r.PartNo)
                 .Select(r => r.WithTotal())
                 .ToList();
         }
@@ -175,7 +257,6 @@ namespace MSFC.UC
 
         private class SummaryRow
         {
-            // Sửa constructor để nhận thêm partNo
             public SummaryRow(DateOnly date, string partNo)
             {
                 Date = date.ToString("yyyy-MM-dd");
@@ -183,10 +264,7 @@ namespace MSFC.UC
             }
 
             public string Date { get; set; }
-
-            // Thêm property PartNo
             public string PartNo { get; set; }
-
             public int Slot0730To1000 { get; set; }
             public int Slot1000To1230 { get; set; }
             public int Slot1230To1515 { get; set; }
@@ -205,5 +283,3 @@ namespace MSFC.UC
         private readonly record struct ScanRecord(DateTime ScanAt, int Qty, string PartNo);
     }
 }
-    
-

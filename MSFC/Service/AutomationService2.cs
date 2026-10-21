@@ -1,4 +1,4 @@
-﻿
+
 using FlaUI.Core;
 using FlaUI.Core.AutomationElements;
 using FlaUI.Core.Conditions;
@@ -34,6 +34,7 @@ namespace MSFC.Service
         AutomationElement GetChildControl(string parentAutomationId, string childAutomationId, int index);
 
         void ClickTo(string automationId);
+        bool InvokeWithoutFocus(string automationId);
         void SetText(string automationId, string text);
         void SetText(string parentAutomationId, string childAutomationId, string text, int index = 0);
 
@@ -352,6 +353,26 @@ namespace MSFC.Service
             var control = GetControlById(automationId);
             if (control == null) return;
             ClickElement(control);
+        }
+
+        /// <summary>
+        /// Invoke a button through InvokePattern only (no Focus, no mouse) so the target app
+        /// does not become the foreground window. Returns false if the pattern is unavailable.
+        /// </summary>
+        public bool InvokeWithoutFocus(string automationId)
+        {
+            try
+            {
+                var control = GetControlById(automationId);
+                var inv = control?.Patterns.Invoke;
+                if (inv == null || !inv.IsSupported) return false;
+                inv.Pattern.Invoke();
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
         }
 
         public void ClickElement(AutomationElement control)

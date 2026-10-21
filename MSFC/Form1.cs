@@ -1,4 +1,4 @@
-﻿using DocumentFormat.OpenXml.Spreadsheet;
+using DocumentFormat.OpenXml.Spreadsheet;
 using FlaUI.Core;
 using FlaUI.Core.AutomationElements;
 using FlaUI.Core.Definitions;   // for TreeScope, ControlType, etc.
@@ -19,7 +19,6 @@ using MSFC.Service;
 using MSFC.Service.Translate;
 using MSFC.UC;
 using QRCoder;
-using ScanOutTool.Services;
 using System;
 using System.Collections.Concurrent;
 using System.ComponentModel;
@@ -47,8 +46,6 @@ using System.Threading.Channels;
 using System.Threading.Tasks;
 using System.Web;
 using System.Windows.Forms.DataVisualization.Charting;
-using UIAutoLib.Interfaces;
-using UIAutoLib.Services;
 using ZXing;
 using ZXing.Common;
 using ZXing.QrCode;
@@ -69,6 +66,9 @@ namespace MSFC
         private readonly IDbContextFactory<MMesDbContext> _dbFactory;
         private readonly IConfiguration _config;
         private SerialPort _portScanner;
+        private string _scannerMode = "COM";
+        private System.Text.StringBuilder _barcodeBuffer = new System.Text.StringBuilder();
+        private System.Windows.Forms.Timer _barcodeTimer = new System.Windows.Forms.Timer();
         private SerialPort _portSFC;
         private PrintDocument printDoc = new PrintDocument();
 
@@ -99,9 +99,7 @@ namespace MSFC
         private readonly object _elLock = new object();
 
 
-        //========== Sound alarm ==========
-        SoundPlayer OKplayer = new SoundPlayer(new MemoryStream(Properties.Resources.PASS));
-        SoundPlayer NGplayer = new SoundPlayer(new MemoryStream(Properties.Resources.FAIL));
+        //========== Sound alarm (Đã tự động load từ thư mục sound/ hoặc Resource) ==========
 
         //========== Data for tab label ==========
         private ManufacturingTagDto _tagLabel = new ManufacturingTagDto();
@@ -127,13 +125,22 @@ namespace MSFC
             _4M = section["4M"] ?? string.Empty;
 
             InitializeComponent();
+            try { this.Icon = GetAppIcon(); } catch { }
 
             // Setup Chart
             SetupDonut(chartProgress);
 
-            //// Setup COM
-            //SetupPortScanner();
-            //SetupPortSFC();
+            // Setup COM
+            try
+            {
+                SetupPortScanner();
+                SetupPortSFC();
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"[Setup COM Error] {ex.Message}");
+            }
+            StartScanWorker();
 
 
             // Printer
@@ -160,15 +167,83 @@ namespace MSFC
 
             cbManualQty.CheckedChanged += QuantityMode_CheckedChanged;
             cb6PCBs.CheckedChanged += QuantityMode_CheckedChanged;
+            cb8PCBs.CheckedChanged += QuantityMode_CheckedChanged;
+            cb12PCBs.CheckedChanged += QuantityMode_CheckedChanged;
             cb20PCBs.CheckedChanged += QuantityMode_CheckedChanged;
             cb24PCBs.CheckedChanged += QuantityMode_CheckedChanged;
             SetupQuantityCheckboxes();
 
-
-            //richTextBox1.ReadOnly = true;
-
-
+            SetupSettingButton();
+            this.Shown += async (s, e) => { await CheckAutoUpdateOnStartupAsync(); };
         }
+
+        private void SetupSettingButton()
+        {
+            try
+            {
+                System.Windows.Forms.Button btnSetting = new System.Windows.Forms.Button
+                {
+                    Text = "⚙️ Settings",
+                    Size = new Size(110, 34),
+                    BackColor = Color.White,
+                    ForeColor = Color.Black,
+                    FlatStyle = FlatStyle.Flat,
+                    Font = new Font("Segoe UI", 9.5F, FontStyle.Bold),
+                    Cursor = Cursors.Hand
+                };
+                btnSetting.FlatAppearance.BorderSize = 1;
+                btnSetting.FlatAppearance.BorderColor = Color.DarkGray;
+
+                btnSetting.Click += (s, e) =>
+                {
+                    using var pwdDlg = new frmAdminPassword();
+                    if (pwdDlg.ShowDialog(this) == DialogResult.OK && pwdDlg.IsAuthenticated)
+                    {
+                        using var settingsDlg = new frmSettings();
+                        settingsDlg.ShowDialog(this);
+                    }
+                };
+
+                btnSetting.Anchor = AnchorStyles.Bottom | AnchorStyles.Left;
+                btnSetting.Location = new Point(10, this.ClientSize.Height - 42);
+                this.Controls.Add(btnSetting);
+                btnSetting.BringToFront();
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"[SetupSettingButton Error] {ex.Message}");
+            }
+        }
+
+        private async Task CheckAutoUpdateOnStartupAsync()
+        {
+            try
+            {
+                string serverUrl = AppConfigManager.GetValue("AppUpdate", "ServerUrl", "http://10.195.89.20:9999");
+                string checkApi = AppConfigManager.GetValue("AppUpdate", "CheckApi", "/api/app-update/check?currentVersion={0}");
+                string currentVersion = AppConfigManager.GetValue("AppUpdate", "CurrentVersion", "1.0.0");
+
+                var updateService = new UpdateService();
+                var response = await updateService.CheckForUpdatesAsync(serverUrl, checkApi, currentVersion);
+
+                if (response != null && (response.HasUpdate || string.Compare(response.LatestVersion, response.CurrentVersion) > 0))
+                {
+                    if (this.IsHandleCreated && !this.IsDisposed)
+                    {
+                        this.BeginInvoke(() =>
+                        {
+                            using var dlg = new frmUpdateNotice(response);
+                            dlg.ShowDialog(this);
+                        });
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"[AutoUpdate Check Error] {ex.Message}");
+            }
+        }
+
         private void EnsureHandles()
         {
             // tránh race nếu STA worker và thread khác cùng vào
@@ -214,6 +289,73 @@ namespace MSFC
         private static extern IntPtr SendMessage(IntPtr hWnd, int msg, bool wParam, int lParam);
         const int WM_SETREDRAW = 0x000B;
 
+        [System.Runtime.InteropServices.DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();
+        [System.Runtime.InteropServices.DllImport("user32.dll")] private static extern bool SetForegroundWindow(IntPtr hWnd);
+        [System.Runtime.InteropServices.DllImport("user32.dll")] private static extern bool BringWindowToTop(IntPtr hWnd);
+        [System.Runtime.InteropServices.DllImport("user32.dll")] private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+        [System.Runtime.InteropServices.DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr hWnd, IntPtr lpdwProcessId);
+        [System.Runtime.InteropServices.DllImport("user32.dll")] private static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+        [System.Runtime.InteropServices.DllImport("kernel32.dll")] private static extern uint GetCurrentThreadId();
+
+        // No simulated ALT key here: an ALT tap puts the window into menu mode and swallows the next scan.
+        private static void ForceForeground(Form target)
+        {
+            if (target.IsDisposed || !target.IsHandleCreated) return;
+            IntPtr hWnd = target.Handle;
+            IntPtr fg = GetForegroundWindow();
+            if (fg == hWnd) return;
+
+            if (target.WindowState == FormWindowState.Minimized) ShowWindow(hWnd, 9); // SW_RESTORE
+
+            uint fgThread = GetWindowThreadProcessId(fg, IntPtr.Zero);
+            uint myThread = GetCurrentThreadId();
+            bool attached = fgThread != 0 && fgThread != myThread && AttachThreadInput(myThread, fgThread, true);
+            try
+            {
+                BringWindowToTop(hWnd);
+                SetForegroundWindow(hWnd);
+                target.Activate();
+            }
+            finally
+            {
+                if (attached) AttachThreadInput(myThread, fgThread, false);
+            }
+        }
+
+        // Printer driver / SFC may grab the foreground asynchronously, so retry aggressively
+        private async void ReclaimFocusAfterSfc()
+        {
+            if (this.IsDisposed || !this.IsHandleCreated) return;
+            
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            // Aggressively monitor and reclaim focus for 3.0 seconds
+            while (sw.ElapsedMilliseconds < 3000)
+            {
+                if (this.IsDisposed || _alertOpen) return;
+                
+                try 
+                {
+                    // Always ensure we are on the UI thread for Handle access and window activation
+                    if (this.InvokeRequired)
+                    {
+                        this.BeginInvoke(new Action(() => 
+                        {
+                            if (!this.IsDisposed && !_alertOpen && GetForegroundWindow() != this.Handle)
+                                ForceForeground(this);
+                        }));
+                    }
+                    else
+                    {
+                        if (GetForegroundWindow() != this.Handle)
+                            ForceForeground(this);
+                    }
+                } 
+                catch { }
+                
+                await Task.Delay(150);
+            }
+        }
+
         sealed class RedrawScope : IDisposable
         {
             private readonly System.Windows.Forms.Control _ctrl;
@@ -251,6 +393,8 @@ namespace MSFC
             _suppressQuantityEvents = true;
             cbManualQty.Checked = true;
             cb6PCBs.Checked = false;
+            cb8PCBs.Checked = false;
+            cb12PCBs.Checked = false;
             cb20PCBs.Checked = false;
             cb24PCBs.Checked = false;
             _suppressQuantityEvents = false;
@@ -265,19 +409,24 @@ namespace MSFC
             if (!ReferenceEquals(changed, cb6PCBs)) cb6PCBs.Checked = false;
             if (!ReferenceEquals(changed, cb24PCBs)) cb24PCBs.Checked = false;
             if (!ReferenceEquals(changed, cb20PCBs)) cb20PCBs.Checked = false;
+            if (!ReferenceEquals(changed, cb8PCBs)) cb8PCBs.Checked = false;
+            if (!ReferenceEquals(changed, cb12PCBs)) cb12PCBs.Checked = false;
             _suppressQuantityEvents = false;
 
             TryAutoPrintByQuantity();
         }
 
+        private bool IsQuantityReached()
+        {
+            if (!int.TryParse(lbPreviewScanQty.Text, out var qty)) return false;
+
+            return (cb6PCBs.Checked && qty == 6) || (cb24PCBs.Checked && qty == 24) || (cb20PCBs.Checked && qty == 20) ||
+                   (cb12PCBs.Checked && qty == 12) || (cb8PCBs.Checked && qty == 8);
+        }
+
         private void TryAutoPrintByQuantity()
         {
-            if (!int.TryParse(lbPreviewScanQty.Text, out var qty)) return;
-
-            if ((cb6PCBs.Checked && qty == 6) || (cb24PCBs.Checked && qty == 24) || (cb20PCBs.Checked && qty == 20))
-            {
-                btnPrint.PerformClick();
-            }
+            if (IsQuantityReached()) btnPrint.PerformClick();
         }
         private static bool SetIfChanged(System.Windows.Forms.TextBox tb, string text)
         {
@@ -288,12 +437,12 @@ namespace MSFC
         }
 
         // Khai báo static field
-        private static System.Media.SoundPlayer _okPlayer;
-        private static System.Media.SoundPlayer _ngPlayer;
+        private static System.Media.SoundPlayer? _okPlayer;
+        private static System.Media.SoundPlayer? _ngPlayer;
         private static volatile bool _soundReady;
         private static readonly object _soundLock = new();
 
-        // Hàm đảm bảo nạp resource chỉ 1 lần
+        // Hàm đảm bảo nạp âm thanh (Ưu tiên thư mục sound/ ngoài app, fallback về Embedded Resource)
         private void EnsureSoundsLoaded()
         {
             if (_soundReady) return;
@@ -301,15 +450,48 @@ namespace MSFC
             {
                 if (_soundReady) return;
 
-                // Dùng resource nhúng (Properties.Resources.PASS/FAIL là byte[])
-                _okPlayer = new System.Media.SoundPlayer(new MemoryStream(Properties.Resources.PASS));
-                _ngPlayer = new System.Media.SoundPlayer(new MemoryStream(Properties.Resources.FAIL));
+                string soundDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "sound");
 
-                _okPlayer.Load();   // preload vào RAM
-                _ngPlayer.Load();
+                string? okFilePath = GetSoundFilePath(soundDir, "PASS.wav", "Pass.wav", "pass.wav", "OK.wav", "Ok.wav", "ok.wav");
+                string? ngFilePath = GetSoundFilePath(soundDir, "FAIL.wav", "Fail.wav", "fail.wav", "NG.wav", "Ng.wav", "ng.wav");
+
+                _okPlayer = CreateSoundPlayer(okFilePath, Properties.Resources.PASS);
+                _ngPlayer = CreateSoundPlayer(ngFilePath, Properties.Resources.FAIL);
+
+                try { _okPlayer?.Load(); } catch { }
+                try { _ngPlayer?.Load(); } catch { }
 
                 _soundReady = true;
             }
+        }
+
+        private static string? GetSoundFilePath(string dir, params string[] filenames)
+        {
+            if (!Directory.Exists(dir)) return null;
+            foreach (var file in filenames)
+            {
+                string path = Path.Combine(dir, file);
+                if (File.Exists(path)) return path;
+            }
+            return null;
+        }
+
+        private static System.Media.SoundPlayer CreateSoundPlayer(string? filePath, byte[] defaultResource)
+        {
+            if (!string.IsNullOrEmpty(filePath) && File.Exists(filePath))
+            {
+                try
+                {
+                    // Đọc toàn bộ byte vào MemoryStream để không khóa (lock) file sound trên ổ đĩa
+                    byte[] soundBytes = File.ReadAllBytes(filePath);
+                    return new System.Media.SoundPlayer(new MemoryStream(soundBytes));
+                }
+                catch
+                {
+                    // Fallback nếu đọc file ngoài thất bại
+                }
+            }
+            return new System.Media.SoundPlayer(new MemoryStream(defaultResource));
         }
 
         // Hàm phát âm thanh (đã preload)
@@ -427,15 +609,7 @@ namespace MSFC
                     // 6.6) Progress – chỉ cập nhật khi OK (không mismatch) **và** giá trị khác
                     if (finalKind == ResultKind.Ok)
                     {
-                        lock (_pendingLock)
-                        {
-                            _pendingPids.Add(data.PID);
-                        }
-                        //SetIfChanged(lbPreviewScanQty, (_pendingPids.Count() + 1).ToString());
-                        if (SetIfChanged(lbPreviewScanQty, _pendingPids.Count().ToString()))
-                        {
-                            TryAutoPrintByQuantity();
-                        }
+                        // Counting + auto-print are owned by the scan queue worker (Form1.ScanQueue.cs)
                         var (completedQty, woQty) = ExtractProgressSafe(data.Progress);
                         int done = Math.Max(0, completedQty);
                         int total = Math.Max(1, woQty);
@@ -548,8 +722,14 @@ namespace MSFC
                 }
 
 
-                // Clear lỗi trên SFC
-                _automationService2.ClickTo(_config2.Controls.ClearButton);
+                // Clear lỗi trên SFC (InvokePattern không focus → SFC không giành focus của scanner)
+                if (!_automationService2.InvokeWithoutFocus(_config2.Controls.ClearButton))
+                {
+                    _automationService2.ClickTo(_config2.Controls.ClearButton);
+                }
+                
+                // SFC may still asynchronously take focus when clearing, so unconditionally reclaim it
+                ReclaimFocusAfterSfc();
 
             }
             catch
@@ -630,7 +810,7 @@ namespace MSFC
 
         #region Task upload PID lên DB
 
-        private async Task UploadToDb(PCB data, CancellationToken ct = default)
+        private async Task<bool> UploadToDb(PCB data, CancellationToken ct = default)
         {
 
             // B3: DB I/O (không UI thread)
@@ -671,15 +851,16 @@ namespace MSFC
                 //        _pendingPids.Add(data.PID);
                 //    }
                 //}
+                return true;
             }
             catch (Exception ex)
             {
-                // log hoặc hiện thông báo (UI thông báo nên đưa qua OnUiAsync)
                 AddLog("DB error: " + ex.Message);
-                // tùy nhu cầu: rethrow hoặc nuốt
-                // throw;
+                LastUploadError = ex.Message;
+                return false;
             }
         }
+        private volatile string LastUploadError = string.Empty;
         private UploadBackgroundService _uploadSvc;
 
         private void InitUploadService()
@@ -759,52 +940,106 @@ namespace MSFC
 
         private void SetupPortScanner()
         {
-            var section = _config.GetSection("PortScanner");
-
-            string portName = section["PortName"] ?? "COM1";
-            int baudRate = int.Parse(section["BaudRate"] ?? "9600");
-            Parity parity = Enum.Parse<Parity>(section["Parity"] ?? "None");
-            int dataBits = int.Parse(section["DataBits"] ?? "8");
-            StopBits stopBits = Enum.Parse<StopBits>(section["StopBits"] ?? "One");
-
-            _portScanner = new SerialPort(portName, baudRate, parity, dataBits, stopBits);
-            _portScanner.DataReceived += PortScanner_DataReceived;
-            _portScanner.Open();
-        }
-        private void SetupPortSFC()
-        {
-            var section = _config.GetSection("PortSFC");
-
-            string portName = section["PortName"] ?? "COM1";
-            int baudRate = int.Parse(section["BaudRate"] ?? "9600");
-            Parity parity = Enum.Parse<Parity>(section["Parity"] ?? "None");
-            int dataBits = int.Parse(section["DataBits"] ?? "8");
-            StopBits stopBits = Enum.Parse<StopBits>(section["StopBits"] ?? "One");
-
-            _portSFC = new SerialPort(portName, baudRate, parity, dataBits, stopBits);
-            _portSFC.DataReceived += PortSFC_DataReceived;
-            _portSFC.Open();
-        }
-        private async void PortScanner_DataReceived(object sender, SerialDataReceivedEventArgs e)
-        {
-            CurrentPid = _portScanner.ReadExisting();
-
-            using var db = await _dbFactory.CreateDbContextAsync();
-
-            // 1. Check PID is block?
-            var isBlock = await db.TbBlocks
-                .Where(x => x.Pid.ToLower() == CurrentPid.ToLower() && x.Status.ToLower() == "b")
-                .FirstOrDefaultAsync();
-            if (isBlock != null)
+            try
             {
-                ShowDetailStatus($"{CurrentPid} {isBlock.History}");
-                return;
+                var section = _config.GetSection("PortScanner");
+                _scannerMode = section["PortName"] ?? "COM2";
+
+                if (_scannerMode.Equals("KeyboardHID", StringComparison.OrdinalIgnoreCase))
+                {
+                    int timeoutMs = 50;
+                    if (int.TryParse(section["KeyboardTimeoutMs"], out int t)) timeoutMs = t;
+
+                    _barcodeTimer.Interval = timeoutMs;
+                    _barcodeTimer.Tick += BarcodeTimer_Tick;
+                    this.KeyPress += Form1_KeyPress;
+                    System.Diagnostics.Debug.WriteLine($"[SetupPortScanner Info] Scanner configured in KeyboardHID mode.");
+                    return;
+                }
+
+                int baudRate = 9600;
+                int.TryParse(section["BaudRate"] ?? "9600", out baudRate);
+                Parity parity = Enum.TryParse<Parity>(section["Parity"] ?? "None", out var p) ? p : Parity.None;
+                int dataBits = 8;
+                int.TryParse(section["DataBits"] ?? "8", out dataBits);
+                StopBits stopBits = Enum.TryParse<StopBits>(section["StopBits"] ?? "One", out var sb) ? sb : StopBits.One;
+
+                _portScanner = new SerialPort(_scannerMode, baudRate, parity, dataBits, stopBits);
+                _portScanner.DataReceived += PortScanner_DataReceived;
+                _portScanner.Open();
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"[SetupPortScanner Warning] Could not open PortScanner COM port: {ex.Message}");
+            }
+        }
+
+        private void Form1_KeyPress(object sender, KeyPressEventArgs e)
+        {
+            if (_scannerMode != "KeyboardHID") return;
+            if (HandleScanChar(e.KeyChar)) e.Handled = true;
+        }
+
+        /// <summary>Accumulates keyboard-wedge chars; returns true when Enter completed a barcode.</summary>
+        private bool HandleScanChar(char c)
+        {
+            if (c == (char)13)
+            {
+                _barcodeTimer.Stop();
+                string scannedData = _barcodeBuffer.ToString();
+                _barcodeBuffer.Clear();
+                if (string.IsNullOrWhiteSpace(scannedData)) return false;
+                ProcessScannedData(scannedData);
+                return true;
             }
 
-            // 2. Send PID to SFC
-            _portSFC.WriteLine($"{CurrentPid}");
+            _barcodeBuffer.Append(c);
+            _barcodeTimer.Stop();
+            _barcodeTimer.Start();
+            return false;
+        }
 
+        private void BarcodeTimer_Tick(object sender, EventArgs e)
+        {
+            _barcodeTimer.Stop();
+            _barcodeBuffer.Clear();
+        }
 
+        private void SetupPortSFC()
+        {
+            try
+            {
+                var section = _config.GetSection("PortSFC");
+                string portName = section["PortName"] ?? "COM1";
+                int baudRate = int.Parse(section["BaudRate"] ?? "9600");
+                Parity parity = Enum.Parse<Parity>(section["Parity"] ?? "None");
+                int dataBits = int.Parse(section["DataBits"] ?? "8");
+                StopBits stopBits = Enum.Parse<StopBits>(section["StopBits"] ?? "One");
+
+                _portSFC = new SerialPort(portName, baudRate, parity, dataBits, stopBits);
+                _portSFC.DataReceived += PortSFC_DataReceived;
+                _portSFC.Open();
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"[SetupPortSFC Warning] Could not open PortSFC COM port: {ex.Message}");
+            }
+        }
+
+        private void PortScanner_DataReceived(object sender, SerialDataReceivedEventArgs e)
+        {
+            try
+            {
+                if (_portScanner == null || !_portScanner.IsOpen) return;
+                string rawInput = _portScanner.ReadExisting();
+                // Several fast scans can arrive in one read → enqueue each line separately
+                foreach (var part in rawInput.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
+                    ProcessScannedData(part);
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"[PortScanner_DataReceived Error] {ex.Message}");
+            }
         }
         private void PortSFC_DataReceived(object sender, SerialDataReceivedEventArgs e)
         {
@@ -918,7 +1153,21 @@ namespace MSFC
 
         private async void btnPrint_Click(object sender, EventArgs e)
         {
+            // Manual/Space print must not interleave with a PID that is still waiting for SFC
+            if (!await _sfcGate.WaitAsync(0))
+            {
+                ShowDetailStatus("Procesando cola de escaneo, espere un momento...");
+                return;
+            }
+            try { await PrintAndResetCoreAsync(); }
+            finally { _sfcGate.Release(); }
+        }
+
+        private async Task PrintAndResetCoreAsync()
+        {
             var msg = string.Empty;
+
+            // 1. Chờ đồng bộ hóa dữ liệu nền (nếu có)
             if (_uploadSvc.IsAnyRunning())
             {
                 msg = "Sincronizando servidor, por favor espere";
@@ -929,7 +1178,6 @@ namespace MSFC
             msg = "Sincronización completada. Comienza a imprimir sellos.";
             ShowDetailStatus(msg);
 
-            // Preserve previous TopMost and make form top-most while printing
             bool prevTopMost = this.TopMost;
             try
             {
@@ -937,103 +1185,112 @@ namespace MSFC
                 this.BringToFront();
                 this.Activate();
 
-                try
+                // 2. Lấy danh sách PID cần in
+                string[] batchPids;
+                lock (_pendingLock)
                 {
-                    //if (!lbStatus.Text.Equals("OK", StringComparison.OrdinalIgnoreCase))
-                    //{
-                    //    ShowDetailStatus("El último PID escaneado debe ser OK y coincidir con EBR.");
-                    //    return;
-                    //}
-
-                    // snapshot danh sách PID đang chờ in (batch hiện tại)
-                    string[] batchPids;
-                    lock (_pendingLock)
-                    {
-                        batchPids = _pendingPids.ToArray();
-                    }
-                    AddLog($"[DEBUG] batchPids: {string.Join(",\r\n", batchPids)}");
-                    AddLog($"[DEBUG] _ClientIp: {_ClientIp}, _settingEBR: {_settingEBR}");
-
-                    // And after fetching tagDatas:
-
-                    if (batchPids.Length == 0)
-                    {
-                        ShowDetailStatus("No hay PIDs pendientes para imprimir.");
-                        return;
-                    }
-
-                    using var db = await _dbFactory.CreateDbContextAsync();
-
-                    // Lấy đúng các dòng thuộc batch hiện tại, chưa in
-                    var tagDatas = await (
-                        from s in db.TbScanOuts
-                        join m in db.TbModelDicts on s.PartNo equals m.PartNo into gj
-                        from m in gj.DefaultIfEmpty()     // <-- left join
-                        where batchPids.Contains(s.Pid)
-                        select new
-                        {
-                            PartNo = m != null ? m.PartNo : null,   // có thể null nếu không match
-                            ModelName = m != null ? m.ModelName : null,
-                            Board = m != null ? m.Board : null,
-                            Pid = s.Pid
-                        }
-                    ).ToListAsync();
-
-                    AddLog($"[DEBUG] tagDatas.Count: {tagDatas.Count}");
-                    if (tagDatas.Count == 0)
-                    {
-                        ShowDetailStatus("No se encontraron PIDs válidos en el lote actual.");
-                        //// loại các PID không còn match khỏi batch để tránh lặp vô hạn
-                        //lock (_pendingLock)
-                        //{
-                        //    foreach (var pid in batchPids) _pendingPids.Remove(pid);
-                        //}
-                        return;
-                    }
-
-                    var now = DateTime.Now;
-                    long tagId = GenerateTagId();
-
-                    //AddLog("Assign data for tag label\r\n");
-                    _tagLabel = new ManufacturingTagDto
-                    {
-                        ModelName = $"{tagDatas[0].ModelName}-{tagDatas[0].Board}",
-                        Date = now.ToString("dd/MM/yyyy"),
-                        PartNo = tagDatas[0].PartNo,
-                        Quantity = tagDatas.Count,
-                        TagId = tagId,
-                        PidList = tagDatas.Select(x => x.Pid).ToList()
-                    };
-
-                    //AddLog("Print\r\n");
-                    PrintTag(_tagLabel);
-
-                    AddLog($"[DEBUG] Start update database");
-                    await db.TbScanOuts
-                        .Where(x => _tagLabel.PidList.Contains(x.Pid))
-                        .ExecuteUpdateAsync(s => s
-                            .SetProperty(r => r.TagId, r => tagId)
-                            .SetProperty(r => r.PrintAt, r => DateTime.Now)
-                            .SetProperty(r => r.PrintDate, r => DateOnly.FromDateTime(DateTime.Now))
-                        );
-                    AddLog($"[DEBUG] Start reset all data");
-
-                    resetUI();
-
-                    AddLog($"[DEBUG] Completed! Reset all data");
+                    batchPids = _pendingPids.ToArray();
                 }
-                catch (Exception ex)
+
+                if (batchPids.Length == 0)
                 {
-                    AddLog(ex.Message);
+                    ShowDetailStatus("No hay PIDs pendientes para imprimir.");
+                    return;
                 }
+
+                using var db = await _dbFactory.CreateDbContextAsync();
+
+                // 3. Query thông tin từ Database
+                var tagDatas = await (
+                    from s in db.TbScanOuts
+                    join m in db.TbModelDicts on s.PartNo equals m.PartNo into gj
+                    from m in gj.DefaultIfEmpty()
+                    where batchPids.Contains(s.Pid)
+                    select new
+                    {
+                        PartNo = m != null ? m.PartNo : null,
+                        ModelName = m != null ? m.ModelName : null,
+                        Board = m != null ? m.Board : null,
+                        Pid = s.Pid
+                    }
+                ).ToListAsync();
+
+                if (tagDatas.Count == 0)
+                {
+                    ShowDetailStatus("No se encontraron PIDs válidos en el lote actual.");
+                    return;
+                }
+
+                var firstItem = tagDatas[0];
+                string finalModelName;
+
+                // Ưu tiên lấy từ Textbox trước
+                string manualModelName = txtModelName.Text.Trim();
+
+                if (!string.IsNullOrWhiteSpace(manualModelName))
+                {
+                    // Nếu có nhập tay thì dùng luôn
+                    finalModelName = manualModelName;
+                }
+                else
+                {
+                    // Nếu textbox trống thì mới fallback về dữ liệu DB
+                    if (!string.IsNullOrWhiteSpace(firstItem.ModelName))
+                    {
+                        finalModelName = $"{firstItem.ModelName}-{firstItem.Board}";
+                    }
+                    else
+                    {
+                        // Trường hợp cả 2 đều không có dữ liệu
+                        finalModelName = string.Empty;
+                    }
+                }
+                // ---------------------
+
+                var now = DateTime.Now;
+                long tagId = GenerateTagId();
+
+                // Ưu tiên lấy PartNo từ text setting (scan đầu tiên) để tránh dữ liệu DB bị lệch hoặc lỗi
+                string currentEbr = txtSettingEBR.Text.Trim();
+                string finalPartNo = !string.IsNullOrEmpty(currentEbr) ? currentEbr : firstItem.PartNo;
+
+                _tagLabel = new ManufacturingTagDto
+                {
+                    ModelName = finalModelName,
+                    Date = now.ToString("dd/MM/yyyy HH:mm:ss"),
+                    PartNo = finalPartNo,
+                    Quantity = tagDatas.Count,
+                    TagId = tagId,
+                    PidList = tagDatas.Select(x => x.Pid).ToList()
+                };
+
+                PrintTag(_tagLabel);
+
+                AddLog($"[DEBUG] Print Success! Start update database...");
+
+                await db.TbScanOuts
+                    .Where(x => _tagLabel.PidList.Contains(x.Pid))
+                    .ExecuteUpdateAsync(s => s
+                        .SetProperty(r => r.TagId, r => tagId)
+                        .SetProperty(r => r.PrintAt, r => DateTime.Now)
+                        .SetProperty(r => r.PrintDate, r => DateOnly.FromDateTime(DateTime.Now))
+                    );
+
+                AddLog($"[DEBUG] Start reset all data");
+                resetUI();
+                AddLog($"[DEBUG] Completed! Reset all data");
+            }
+            catch (Exception ex)
+            {
+                // Ghi log lỗi để dễ debug
+                AddLog($"[ERROR] Print Failed: {ex.Message}");
+                resetUI();
             }
             finally
             {
-                // restore previous TopMost value
                 this.TopMost = prevTopMost;
             }
         }
-
         static int MmToHundredths(float mm) => (int)Math.Round(mm / 25.4f * 100f);
         void PrintTag(ManufacturingTagDto tag)
         {
@@ -1041,237 +1298,198 @@ namespace MSFC
             {
                 AddLog("PrintTag: Start printing tag.");
                 var doc = new PrintDocument();
+
+                if (!doc.PrinterSettings.IsValid) throw new Exception("Không tìm thấy máy in hợp lệ.");
+
+                doc.PrintController = new System.Drawing.Printing.StandardPrintController();
                 doc.PrinterSettings = new PrinterSettings();
 
-                // lấy đúng size ~55x38mm từ driver (217x150 hundredths-inch)
+                // Chuyển đổi mm sang đơn vị máy in (hundredths of inch)
+                int w = MmToHundredths(_labelWidthMm); // ~217
+                int h = MmToHundredths(_labelHeightMm); // ~157 (40mm)
+
+                // Tìm khổ giấy khớp với kích thước mới
                 var ps = doc.PrinterSettings.PaperSizes
                     .Cast<PaperSize>()
-                    .FirstOrDefault(p => (Math.Abs(p.Width - 217) < 5 && Math.Abs(p.Height - 150) < 5)
-                                      || (Math.Abs(p.Width - 150) < 5 && Math.Abs(p.Height - 217) < 5));
-                if (ps != null) doc.DefaultPageSettings.PaperSize = ps;
+                    .FirstOrDefault(p =>
+                        (Math.Abs(p.Width - w) < 15 && Math.Abs(p.Height - h) < 15) ||
+                        (Math.Abs(p.Width - h) < 15 && Math.Abs(p.Height - w) < 15)
+                    );
+
+                if (ps != null)
+                    doc.DefaultPageSettings.PaperSize = ps;
+                else
+                    // Nếu không tìm thấy, set cứng kích thước Custom
+                    doc.DefaultPageSettings.PaperSize = new PaperSize($"Custom {_labelWidthMm}x{_labelHeightMm}", w, h);
 
                 doc.DefaultPageSettings.Margins = new System.Drawing.Printing.Margins(0, 0, 0, 0);
-                doc.OriginAtMargins = true;              // (0,0) = MarginBounds.TopLeft
-                doc.DefaultPageSettings.Landscape = false; // nếu bị xoay hãy thử true
-                AddLog("PrintTag: Start generate label...");
+                doc.OriginAtMargins = true;
+                doc.DefaultPageSettings.Landscape = false;
+
                 _tagLabel = tag;
                 doc.PrintPage += GenerateLabel_FitMarginBounds;
 
-                AddLog("PrintTag: Calling doc.Print()...");
                 doc.Print();
-                AddLog("PrintTag: Print completed.");
+                AddLog("PrintTag: Print command sent.");
+
+                // Trả lại focus cho app sau khi driver máy in có thể đã cướp focus
+                ReclaimFocusAfterSfc();
             }
             catch (Exception ex)
             {
-                AddLog($"PrintTag: Exception - {ex.Message}\r\n{ex.StackTrace}");
+                AddLog($"PrintTag Error: {ex.Message}");
                 throw;
             }
         }
 
         void GenerateLabel_FitMarginBounds(object sender, PrintPageEventArgs e)
         {
+            if (_tagLabel == null) { e.Cancel = true; return; }
             var g = e.Graphics;
+
             try
             {
-                // safety
-                if (_tagLabel == null)
-                {
-                    e.HasMorePages = false;
-                    return;
-                }
-
-                // device bounds prefer MarginBounds
                 Rectangle deviceBounds = e.MarginBounds;
-                if (deviceBounds.Width <= 0 || deviceBounds.Height <= 0)
-                {
-                    deviceBounds = new Rectangle(e.PageBounds.Left + 10, e.PageBounds.Top + 10,
-                                                 Math.Min(400, e.PageBounds.Width - 20),
-                                                 Math.Min(300, e.PageBounds.Height - 20));
-                }
 
-                // apply offsets (in hundredths of inch)
-                int offX = MmToHundredths(_offsetXmm);
-                int offY = MmToHundredths(_offsetYmm);
-                var dest = new Rectangle(deviceBounds.Left + offX, deviceBounds.Top + offY, deviceBounds.Width, deviceBounds.Height);
+                // Thiết lập kích thước thiết kế theo biến cấu hình
+                float designW = MmToHundredths(_labelWidthMm);
+                float designH = MmToHundredths(_labelHeightMm);
 
-                if (dest.Width <= 0 || dest.Height <= 0)
-                {
-                    e.HasMorePages = false;
-                    return;
-                }
+                // Tính scale (chỉ theo chiều rộng để đảm bảo vừa ngang)
+                float scale = (float)deviceBounds.Width / designW;
+                if (scale > 1.0f) scale = 1.0f; // Không phóng to nếu giấy quá rộng
 
-                // DESIGN: 55mm x 38mm => design units in hundredths of inch
-                float designW = 217f; // ~55mm
-                float designH = 150f; // ~38mm
+                float drawnW = designW * scale;
 
-                // Compute key layout values in design units (same logic as DrawTag_DesignUnits)
-                float padY = designH * 0.05f;            // top/bottom pad used in DrawTag_DesignUnits
-                float titleHeight = designH * 0.18f;     // title area height
-                                                         // yStart = padY + titleHeight + small gap (0.02*H)
-                float yStart = padY + titleHeight + designH * 0.02f;
-                // textH = (H - padY) - yStart
-                float textH = (designH - padY) - yStart;
-                float lineH = textH / 4f;                // 4 lines, last one is Q'TY
-                                                         // bottom of Q'TY line sits at: yStart + 3*lineH + lineH = yStart + textH = designH - padY
-                float bottomOfQty = designH - padY;
+                // --- TÍNH TOẠ ĐỘ ---
+                // 1. Căn giữa ngang
+                float translateX = deviceBounds.Left + (deviceBounds.Width - drawnW) / 2f;
 
-                // small extra gap after Q'TY in mm (how much paper you want after the line)
-                float extraGapMm = 0.1f; // tweak this (0.1 mm recommended)
-                int extraGapDeviceUnits = MmToHundredths(extraGapMm); // in hundredths of inch (device units)
+                // 2. Căn dọc: Dùng Top Margin nhỏ (2mm) + Offset
+                float topMarginUnit = MmToHundredths(_topMarginMm);
+                float offsetUnit = MmToHundredths(_offsetYmm);
 
-                // We want to compute required device height to include content up to bottomOfQty + extraGap
-                // Choose scale based on width (so width fits design exactly) — avoids unexpected shrink/stretch
-                float scaleBasedOnWidth = dest.Width / designW;
+                float translateY = deviceBounds.Top + topMarginUnit + offsetUnit;
 
-                // Required device height to include bottomOfQty:
-                float requiredDeviceHeight = bottomOfQty * scaleBasedOnWidth + extraGapDeviceUnits;
-
-                // If device is continuous (dest.Height very large), clamp to requiredDeviceHeight to avoid long feed
-                // We'll consider "continuous" when dest.Height >> designH
-                float continuousThresholdMultiplier = 3.0f;
-                if (dest.Height > designH * continuousThresholdMultiplier)
-                {
-                    // clamp but ensure at least some minimal height
-                    int minAllowed = MmToHundredths(10); // at least 10mm tall as safety floor
-                    int clampH = Math.Max(minAllowed, (int)Math.Ceiling(requiredDeviceHeight));
-                    // limit clamp to dest.Height if smaller
-                    dest = new Rectangle(dest.Left, dest.Top, dest.Width, Math.Min(dest.Height, clampH));
-                    // Recompute scale: prefer width-based scale but ensure not to exceed vertical space
-                    float scaleYIfNeeded = (float)dest.Height / designH;
-                    // final scale chosen should not make content exceed dest: so take min(scaleBasedOnWidth, scaleYIfNeeded)
-                    float scale = Math.Min(scaleBasedOnWidth, scaleYIfNeeded);
-
-                    // final drawn sizes
-                    float drawnW = designW * scale;
-                    float drawnH = bottomOfQty * scale + extraGapDeviceUnits; // we only need height to bottom QTY + gap in device units
-
-                    // compute translate: center horizontally, top align vertically with a small top padding (use offsetYmm)
-                    float translateX = dest.Left + (dest.Width - drawnW) / 2f;
-                    float topPadding = MmToHundredths(1.0f); // 1mm top padding device units
-                    float translateY = dest.Top + topPadding;
-
-                    // Apply transform: note ScaleTransform expects scale relative to design units -> we use 'scale'
-                    var state = g.Save();
-                    try
-                    {
-                        g.TranslateTransform(translateX, translateY);
-                        g.ScaleTransform(scale, scale);
-
-                        // Draw full design in design coordinates; drawing area will be clipped by dest/driver
-                        DrawTag_DesignUnits(g, designW, designH, _tagLabel);
-                    }
-                    finally
-                    {
-                        g.Restore(state);
-                    }
-
-                    e.HasMorePages = false;
-                    return;
-                }
-
-                // Non-continuous case (normal page): compute scale uniformly based on min(scaleX, scaleY)
-                float scaleX = dest.Width / designW;
-                float scaleY = dest.Height / designH;
-                float finalScale = Math.Min(scaleX, scaleY);
-
-                float finalDrawnW = designW * finalScale;
-                float finalDrawnH = designH * finalScale;
-
-                float translateXNormal = dest.Left + (dest.Width - finalDrawnW) / 2f;
-                float topPaddingNormal = MmToHundredths(1.5f);
-                float translateYNormal = dest.Top + topPaddingNormal;
-
-                var stateNormal = g.Save();
+                var state = g.Save();
                 try
                 {
-                    g.TranslateTransform(translateXNormal, translateYNormal);
-                    g.ScaleTransform(finalScale, finalScale);
+                    g.TranslateTransform(translateX, translateY);
+                    g.ScaleTransform(scale, scale);
 
                     DrawTag_DesignUnits(g, designW, designH, _tagLabel);
                 }
                 finally
                 {
-                    g.Restore(stateNormal);
+                    g.Restore(state);
                 }
-
                 e.HasMorePages = false;
             }
             catch (Exception ex)
             {
-                AddLog("[ERROR] GenerateLabel_FitMarginBounds Exception: " + ex.ToString());
+                AddLog("[ERROR] GenerateLabel: " + ex.Message);
                 e.HasMorePages = false;
             }
         }
         #region Print Setting & Generate label tag
         // offset cấu hình (mm). dương = dịch xuống / dịch sang phải
-        float _offsetXmm = 0.0f;   // ví dụ 1.5f để dịch phải 1.5mm
-        float _offsetYmm = 1.5f;   // ví dụ 1.5f để dịch xuống 1.5mm
+        float _offsetXmm = 0f;   // ví dụ 1.5f để dịch phải 1.5mm
+        float _offsetYmm = -2.0f;   // ví dụ 1.5f để dịch xuống 1.5mm
+
+        float _labelWidthMm = 55.0f;  // Chiều rộng tem
+        float _labelHeightMm = 45.0f; // TĂNG LÊN 40mm (Trước là 35mm) để tận dụng khoảng trắng dưới
+        float _topMarginMm = 2.0f; // Giảm chiều cao từ 5mm xuống 2mm
 
         void DrawTag_DesignUnits(Graphics g, float W, float H, ManufacturingTagDto tag)
         {
-            // ———————————————————————————————————————————————————————————
-            // 1) SETUP & LAYOUT PARAMETERS
-            // ———————————————————————————————————————————————————————————
             using var pen = new Pen(Color.Black, 1);
 
-            // Draw Border (Vẽ viền cho Label)
+            // 1. VẼ VIỀN
             g.DrawRectangle(pen, 0, 0, W - 1, H - 1);
 
-            float padX = W * 0.02f;
-            float padY = H * 0.05f;
+            // 2. Padding nhỏ (1.5%)
+            float padX = W * 0.015f;
+            float padY = H * 0.015f;
 
-            // Fonts
-            using var fTitle = new Font("Segoe UI", 14, FontStyle.Bold, GraphicsUnit.Point);
-            using var fBody = new Font("Arial Narrow", 11, FontStyle.Bold, GraphicsUnit.Point);
+            // [TĂNG LẠI CỠ CHỮ]: Vì đã có 40mm chiều cao
+            using var fTitle = new Font("Segoe UI", 11, FontStyle.Bold, GraphicsUnit.Point);
+            using var fBody = new Font("Arial Narrow", 9, FontStyle.Bold, GraphicsUnit.Point);
 
-            // ———————————————————————————————————————————————————————————
-            // 2) TITLE: "Manufacture Tag"
-            // ———————————————————————————————————————————————————————————
-            // Title takes top 15-20%
-            var titleRect = new RectangleF(padX, padY, W - padX * 2, H * 0.18f);
+            // 3. TITLE AREA (Khoảng 16% chiều cao)
+            float titleH = H * 0.16f;
+            var titleRect = new RectangleF(padX, padY, W - padX * 2, titleH);
+
             var sfn = new StringFormat { Alignment = StringAlignment.Near, LineAlignment = StringAlignment.Center };
-
             g.DrawString("Manufacture Tag", fTitle, Brushes.Black, titleRect, sfn);
 
-            float yStart = titleRect.Bottom + H * 0.02f;
-            float textH = (H - padY) - yStart;
-            float lineH = textH / 4.0f; // 4 equal lines
-            float textW = W - padX * 2; // Full width since no QR
+            float separatorY = titleRect.Bottom;
+            g.DrawLine(pen, 0, separatorY, W, separatorY);
 
+            // 4. BODY CONTENT
+            float bodyY = separatorY + 1.0f;
+            float bodyH = (H - padY) - bodyY;
+            float lineH = bodyH / 6.0f; // Chia 6 dòng
 
-            // Helper to draw fit text
+            // QR zone: bên phải label, góc dưới cùng
+            float qrSize = bodyH * 0.45f;                       // Giảm QR xuống 45% chiều cao body
+            float qrGap  = W * 0.015f;                          // khoảng cách giữa text và QR
+            float qrX    = W - padX - qrSize - (W * 0.30f);     // dịch trái 30% chiều rộng nhãn để sát gần Ins1, Ins2
+            float qrY    = bodyY + bodyH - qrSize;              // đẩy QR xuống đáy của body (căn dưới)
+            float textW_narrow  = qrX - qrGap - padX;           // text thu hẹp, không chồng QR
+            float textW_full    = W - padX * 2;                 // text full chiều ngang
+
             void DrawLine(string text, Font font, int index)
             {
-                float y = yStart + index * lineH;
-                var rect = new RectangleF(padX, y, textW, lineH);
-                // Left align for body text
-                var sfnBody = new StringFormat { Alignment = StringAlignment.Near, LineAlignment = StringAlignment.Center };
-                // Using DrawFitText if available, or standard DrawString
-                DrawFitText(g, text, font, Brushes.Black, rect, 6.0f);
+                float y = bodyY + (index * lineH);
+                float currentTextW = (y + lineH * 0.8f > qrY) ? textW_narrow : textW_full;
+                var rect = new RectangleF(padX, y, currentTextW, lineH);
+
+                // Min size 4.5f để đảm bảo không bị quá bé
+                DrawFitText(g, text, font, Brushes.Black, rect, 4.5f);
             }
 
-            // Line 1: Model Name
-            DrawLine($"{tag?.ModelName ?? ""}", fBody, 0);
+            // Line 1: Model
+            DrawLine(tag.ModelName, fBody, 0);
 
             // Line 2: Date
             DrawLine($"Date: {tag?.Date ?? ""}", fBody, 1);
 
-            // Line 3: Part No -> prefer lbPreviewPno.Text, fallback to tag.PartNo
+            // Line 3: Part No
             string partNo = string.IsNullOrWhiteSpace(tag?.PartNo) ? lbPreviewPno.Text : tag.PartNo;
-            string partFormatted = FormatPartNo(partNo ?? "");
-            DrawLine($"Part No: {partFormatted}", fBody, 2);
+            DrawLine($"Part No: {FormatPartNo(partNo ?? "")}", fBody, 2);
 
             // Line 4: Q'ty
             DrawLine($"Q'ty: {tag?.Quantity.ToString() ?? ""}", fBody, 3);
 
-            // Line 5: Inspector 1 (take from txtInspector1 if available, fallback to tag)
+            // Line 5: Inspector 1
             var insp1 = (this.txtInspector1?.Text?.Trim().Length > 0) ? this.txtInspector1.Text.Trim() : (tag?.Inspector1 ?? "");
-            DrawLine($"Inspector 1: {insp1}", fBody, 4);
+            DrawLine($"Ins 1: {insp1}", fBody, 4);
 
-            // Line 6: Inspector 2 (take from txtInspector2 if available, fallback to tag)
+            // Line 6: Inspector 2
             var insp2 = (this.txtInspector2?.Text?.Trim().Length > 0) ? this.txtInspector2.Text.Trim() : (tag?.Inspector2 ?? "");
-            DrawLine($"Inspector 2: {insp2}", fBody, 5);
+            DrawLine($"Ins 2: {insp2}", fBody, 5);
 
+            // 5. QR CODE — nội dung = Part No (EBR)
+            string qrContent = partNo ?? "";
+            if (!string.IsNullOrEmpty(qrContent))
+            {
+                try
+                {
+                    using var qrGenerator = new QRCodeGenerator();
+                    using var qrData      = qrGenerator.CreateQrCode(qrContent, QRCodeGenerator.ECCLevel.M);
+                    using var qrCode      = new QRCode(qrData);
+
+                    int pixelPerModule = 10;
+                    using Bitmap qrBitmap = qrCode.GetGraphic(pixelPerModule, Color.Black, Color.White, drawQuietZones: true);
+
+                    var qrRect = new RectangleF(qrX, qrY, qrSize, qrSize);
+                    g.DrawImage(qrBitmap, qrRect);
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"[QR ERROR] {ex.GetType().Name}: {ex.Message}");
+                }
+            }
         }
 
         string FormatPartNo(string partNo)
@@ -1352,6 +1570,7 @@ namespace MSFC
                     txtInspector1.Enabled = false;
                     txtInspector2.Enabled = false;
                     txtSettingEBR.Enabled = false;
+                    txtModelName.Enabled = false;
                     int maxRetry = 50;
                     int delayMs = 200;
                     bool attached = false, canConnect = false;
@@ -1368,12 +1587,11 @@ namespace MSFC
                         canConnect = await db.Database.CanConnectAsync();
                         if (!canConnect)
                         {
-                            dbMsg = "No se pudo conectar a la base de datos.";
-                            AddLog($"============ Connect to DB fail ============");
+                            dbMsg = "Lỗi kết nối DB";
+                            AddLog($"============ Connect to DB fail (Attempt {attempt}/{maxRetry}) ============");
                             await Task.Delay(delayMs);
                             continue;
                         }
-
 
                         // Check SFC attach
                         try
@@ -1383,6 +1601,7 @@ namespace MSFC
                         }
                         catch (Exception ex)
                         {
+                            SfcMsg = $"Lỗi SFC: {ex.Message}";
                             AddLog($"============ Retry {attempt}/{maxRetry} ============");
                             AddLog(ex.ToString());
                             await Task.Delay(delayMs);
@@ -1396,18 +1615,27 @@ namespace MSFC
                             SfcMsg = "Vinculado exitosamente con SFC (OK)";
                             break;
                         }
-
-
                     }
-
-
 
                     if (!attached || !canConnect)
                     {
-                        lbDetailStatus.ForeColor = Color.Yellow;
+                        lbDetailStatus.ForeColor = Color.OrangeRed;
+
+                        string errorDetail;
+                        if (!canConnect && !attached)
+                            errorDetail = "[BOTH ERROR] Network/DB connection lost AND SFC software not found!";
+                        else if (!canConnect)
+                            errorDetail = "[NETWORK/DB ERROR] Could not connect to Database! Check IP/DB connection.";
+                        else
+                            errorDetail = $"[SOFTWARE ERROR] SFC software is not open ('{_config2.ProcessName}')!";
+
+                        lbDetailStatus.Text = errorDetail;
+                        AddLog($"[SETUP FAIL] {errorDetail}");
+
                         txtInspector1.Enabled = true;
                         txtInspector2.Enabled = true;
                         txtSettingEBR.Enabled = true;
+                        txtModelName.Enabled = true;
                         return;
                     }
 
@@ -1426,6 +1654,7 @@ namespace MSFC
                         txtInspector1.Enabled = true;
                         txtInspector2.Enabled = true;
                         txtSettingEBR.Enabled = true;
+                        txtModelName.Enabled = true;
                         return;
                     }
 
@@ -1438,6 +1667,7 @@ namespace MSFC
                     txtInspector1.Enabled = false;
                     txtInspector2.Enabled = false;
                     txtSettingEBR.Enabled = false;
+                    txtModelName.Enabled = false;
                 }
                 else
                 {
@@ -1459,6 +1689,7 @@ namespace MSFC
                         txtInspector1.Enabled = true;
                         txtInspector2.Enabled = true;
                         txtSettingEBR.Enabled = true;
+                        txtModelName.Enabled = true;
                     }
                 }
             }
@@ -1642,7 +1873,7 @@ namespace MSFC
                     };
 
                     // Nếu là hàng đã scanout rồi thì coi như là OK
-                    if (Classify(resClean) == ResultKind.Ng && data.Message.Contains("Already Shipped", StringComparison.OrdinalIgnoreCase))
+                    if (Classify(resClean) == ResultKind.Ng && data.Message?.Contains("Already Shipped", StringComparison.OrdinalIgnoreCase) == true)
                     {
                         data.Result = "OK";
                         data.Message = data.PID;
@@ -1662,24 +1893,7 @@ namespace MSFC
                     _lastPidValue = data.PID;
                     _lastStatusValue = data.Result;
 
-                    // ===================== 4) GHI DB – CHẠY NỀN =====================
-                    if (Classify(data.Result) == ResultKind.Ok)
-                    {
-                        var snap = new PCB
-                        {
-                            PID = data.PID,
-                            EBR = data.EBR,
-                            WO = data.WO,
-                            Result = data.Result,
-                            Message = data.Message,
-                            Progress = data.Progress,
-                            Inspector1 = data.Inspector1,
-                            Inspector2 = data.Inspector2,
-                        };
-                        _uploadSvc.Enqueue(snap); // fire-and-forget, chạy nền
-
-
-                    }
+                    // DB upload is done by the scan queue worker once SFC confirms OK (see Form1.ScanQueue.cs)
                     _building = false;
                 }
                 catch (OperationCanceledException)
@@ -1790,6 +2004,7 @@ namespace MSFC
 
         protected override async void OnFormClosing(FormClosingEventArgs e)
         {
+            _scanQueue.Writer.TryComplete();
             await StopWatchingPidAsync();
 
             if (_uploadSvc != null)
@@ -1807,10 +2022,7 @@ namespace MSFC
             MessageBox.Show(msg);
         }
 
-        private void btnClearNotice_Click(object sender, EventArgs e)
-        {
-            resetUI();
-        }
+
 
         private void Form1_Load(object sender, EventArgs e)
         {
@@ -1828,6 +2040,11 @@ namespace MSFC
         {
             var frm = new frmTraceAndPrint(_dbFactory);
             frm.ShowDialog();
+        }
+
+        private void btnClearNotice_Click(object sender, EventArgs e)
+        {
+            resetUI();
         }
 
         private async void button1_Click_1(object sender, EventArgs e)
@@ -1889,13 +2106,64 @@ namespace MSFC
             }
         }
 
-        private void btnSummary_Click(object sender, EventArgs e)
+        private void btnXray_Click(object sender, EventArgs e)
         {
-            var summaryForm = new Summary(_dbFactory, _ClientIp)
+            var xrayForm = new MSFC.UC.frmXrayScanSum(_dbFactory, _ClientIp)
             {
                 StartPosition = FormStartPosition.CenterParent
             };
-            summaryForm.Show(this);
+            xrayForm.Show(this);
+        }
+
+        private void btnSummary_Click(object sender, EventArgs e)
+        {
+            var sumForm = new MSFC.UC.Summary(_dbFactory, _ClientIp)
+            {
+                StartPosition = FormStartPosition.CenterParent
+            };
+            sumForm.Show(this);
+        }
+        private void btnRePrint_Click(object sender, EventArgs e)
+        {
+            using (var frm = new MSFC.UC.RePrint())
+            {
+                frm.StartPosition = FormStartPosition.CenterParent;
+                frm.ShowDialog(this);
+            }
+        }
+
+        private static Icon? _appIcon;
+        public static Icon GetAppIcon()
+        {
+            if (_appIcon == null)
+            {
+                try
+                {
+                    string iconPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "haengsunglogo.ico");
+                    if (!File.Exists(iconPath))
+                    {
+                        iconPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "icon.ico");
+                    }
+
+                    if (File.Exists(iconPath))
+                    {
+                        _appIcon = new Icon(iconPath);
+                    }
+                    else
+                    {
+                        _appIcon = Icon.ExtractAssociatedIcon(System.Windows.Forms.Application.ExecutablePath);
+                    }
+                }
+                catch
+                {
+                    try
+                    {
+                        _appIcon = Icon.ExtractAssociatedIcon(System.Windows.Forms.Application.ExecutablePath);
+                    }
+                    catch { }
+                }
+            }
+            return _appIcon!;
         }
     }
     // 1) Helper: STA worker (một thread STA có queue)

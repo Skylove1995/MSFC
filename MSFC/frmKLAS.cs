@@ -1,4 +1,4 @@
-﻿using FlaUI.Core.AutomationElements;
+using FlaUI.Core.AutomationElements;
 using FlaUI.Core.Definitions;
 using FlaUI.Core.Input;
 using FlaUI.Core.Tools;
@@ -51,6 +51,7 @@ namespace MSFC
             _automationService2 = automationService2;
             _Config = klasConfig.Value;
             InitializeComponent();
+            try { this.Icon = Form1.GetAppIcon(); } catch { }
             InitTrayIcon();
         }
         private void AddLog(string msg)
